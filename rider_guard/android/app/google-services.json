@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "369774268229",
+    "project_id": "rider-guard-fef71",
+    "storage_bucket": "rider-guard-fef71.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:369774268229:android:4b9e65b779c702bf05782c",
+        "android_client_info": {
+          "package_name": "com.example.rider_guard"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDkwOzO5htdO6gJmW7Bg3XgVrIGKegYxdY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

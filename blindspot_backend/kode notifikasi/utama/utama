@@ -1,0 +1,298 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <math.h>
+
+// ===== MASUKKAN MAC ADDRESS ESP32 RECEIVER =====
+uint8_t receiverMacAddress[] = {0x88, 0x57, 0x21, 0x8E, 0x45, 0xBC}; 
+
+// ===== SETTING SERIAL RADAR =====
+HardwareSerial radarPos(2); // LD2450 (Posisi) - RX:16, TX:17
+HardwareSerial radarSpd(1); // LD2451 (Kecepatan) - RX:14, TX:27
+
+typedef struct struct_message {
+    float distance;
+    float posX;
+    float speed;
+    uint8_t hazardLevelL; // 0=Aman, 1=Waspada, 2=Bahaya (KIRI)
+    uint8_t hazardLevelR; // 0=Aman, 1=Waspada, 2=Bahaya (KANAN)
+} struct_message;
+
+struct_message myData;
+esp_now_peer_info_t peerInfo;
+
+// ===== KALMAN FILTER STRUCTURE =====
+struct KalmanFilter {
+    float state;           // Estimated value
+    float covariance;      // Estimation error
+    float processNoise;    // Q - how much we trust the model
+    float measurementNoise; // R - how much we trust the sensor
+};
+
+// Create Kalman Filters for X, Y, and Angle
+KalmanFilter kalmanX = {0, 1.0, 0.01, 0.5};      // X position
+KalmanFilter kalmanY = {0, 1.0, 0.005, 0.3};     // Y distance
+KalmanFilter kalmanAngle = {0, 1.0, 0.002, 0.1}; // Angle
+
+// Function for Kalman Filter update
+float kalmanUpdate(KalmanFilter &kf, float measurement) {
+    // Prediction step
+    float predictedCovariance = kf.covariance + kf.processNoise;
+    
+    // Update step
+    float kalmanGain = predictedCovariance / (predictedCovariance + kf.measurementNoise);
+    kf.state = kf.state + kalmanGain * (measurement - kf.state);
+    kf.covariance = (1.0 - kalmanGain) * predictedCovariance;
+    
+    return kf.state;
+}
+
+// ===== SENSOR DATA VARIABLES =====
+float current_dist_pos = 0, current_x_pos = 0, current_dist_spd = 0;
+int16_t current_speed = 0;
+float filteredAngle = 0;
+int8_t lastSideState = 0; // -1=left, 0=center, 1=right
+uint16_t sideDebounceCounter = 0;
+const uint16_t SIDE_DEBOUNCE_THRESHOLD = 4; // min 4 frame untuk stabil di jarak rendah
+float centerBiasX = 0.0;
+uint16_t centerBiasCount = 0;
+
+// Filter FOV (Asli)
+bool insideFOV(float x, float y) {
+    return (x >= - (y * 0.65)) && (x <= (y * 0.55));
+}
+
+void setup() {
+    Serial.begin(115200);
+    radarPos.begin(256000, SERIAL_8N1, 16, 17);
+    radarSpd.begin(256000, SERIAL_8N1, 14, 27);
+
+    WiFi.mode(WIFI_STA);
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("Error ESP-NOW");
+        return;
+    }
+
+    memcpy(peerInfo.peer_addr, receiverMacAddress, 6);
+    peerInfo.channel = 1;
+    peerInfo.encrypt = false;
+    esp_now_add_peer(&peerInfo);
+
+    Serial.println("\n=== DUAL RADAR FUSION (HORIZONTAL MOUNT) ===");
+}
+
+// ===== FUNGSI BACA LD2451 (KECEPATAN) =====
+void processLD2451() {
+    static uint8_t state = 0;
+    static uint8_t buffer[20];
+    static uint8_t idx = 0;
+
+    while (radarSpd.available()) {
+        uint8_t byteIn = radarSpd.read();
+        if (state == 0 && byteIn == 0xF4) { state = 1; }
+        else if (state == 1 && byteIn == 0xF3) { state = 2; }
+        else if (state == 2 && byteIn == 0xF2) { state = 3; }
+        else if (state == 3 && byteIn == 0xF1) { state = 4; idx = 0; }
+        else if (state == 4) {
+            buffer[idx++] = byteIn; 
+            if (idx >= 4 && buffer[idx-4] == 0xF8 && buffer[idx-3] == 0xF7 && buffer[idx-2] == 0xF6 && buffer[idx-1] == 0xF5) {
+                if (idx > 6) {
+                    int16_t y2 = buffer[2] | (buffer[3] << 8);
+                    int16_t s2 = buffer[4] | (buffer[5] << 8);
+                    current_dist_spd = (float)y2 / 1000.0; 
+                    current_speed = s2;
+                } else {
+                    current_dist_spd = 0.0; 
+                    current_speed = 0;
+                }
+                state = 0; 
+            }
+            if (idx >= 20) state = 0; 
+        } else { state = 0; }
+    }
+}
+
+// ===== FUNGSI BACA LD2450 (POSISI) =====
+void processLD2450() {
+    if (radarPos.available() >= 10) {
+        if (radarPos.read() == 0xAA) {
+            if (radarPos.read() == 0xFF) {
+                radarPos.read(); radarPos.read();
+                int16_t raw_x = radarPos.read() | (radarPos.read() << 8);
+                int16_t raw_y = radarPos.read() | (radarPos.read() << 8);
+                
+                float x_m = (raw_x & 0x8000) ? -(raw_x & 0x7FFF) : (raw_x & 0x7FFF);
+                float y_m = abs((raw_y & 0x8000) ? -(raw_y & 0x7FFF) : (raw_y & 0x7FFF));
+
+                if (insideFOV(x_m, y_m)) {
+                    // Apply Kalman Filter untuk stabil data
+                    float kalman_x = kalmanUpdate(kalmanX, x_m);
+                    float kalman_y = kalmanUpdate(kalmanY, y_m);
+
+                    current_x_pos = kalman_x;
+                    current_dist_pos = kalman_y / 1000.0;
+
+                    float angle = atan2(current_x_pos, kalman_y) * 180.0 / PI;
+                    filteredAngle = kalmanUpdate(kalmanAngle, angle);
+                }
+            }
+        }
+    }
+}
+
+void loop() {
+    processLD2451();
+    processLD2450();
+
+    static unsigned long lastSend = 0;
+    if (millis() - lastSend > 50) {
+        lastSend = millis();
+
+        float angle = filteredAngle;
+        uint8_t hL = 0;
+        uint8_t hR = 0;
+
+        // ===== HAZARD LEVEL LOGIC (Batasan 2m HANYA untuk LEFT/RIGHT, BUKAN untuk hazard level) =====
+        uint8_t level = 0;
+        if (abs(current_speed) > 1000) {
+            level = 2; // BAHAYA karena kecepatan tinggi
+        } else if (current_dist_pos > 0.0 && current_dist_pos <= 1.5) {
+            level = 2; // BAHAYA untuk jarak sangat dekat (≤1.5m)
+        } else if (current_dist_pos > 1.5 && current_dist_pos <= 4.0) {
+            level = 1; // WASPADA untuk jarak dekat-medium (1.5-4m) - SAMPAI 4M!
+        }
+        // Else: level = 0 (AMAN, jarak > 4m)
+
+        const float mainFOV = 25.0;
+
+        float sideEnterAngle;
+        float sideExitAngle;
+        float sideEnterX;
+        float sideExitX;
+        float centerZoneX;
+        float centerZoneAngle;
+
+        // Angle thresholds tetap normal dan stabil di semua jarak
+        if (current_dist_pos <= 0.8) {
+            sideEnterAngle = 8.0;
+            sideExitAngle = 4.0;
+            centerZoneAngle = 6.0;
+        } else if (current_dist_pos <= 2.0) {
+            sideEnterAngle = 8.0;    // Tetap sensitif sampai 2m
+            sideExitAngle = 4.0;
+            centerZoneAngle = 6.0;
+        } else {
+            // >2m: tetap gunakan angle normal, hanya tidak send LEFT/RIGHT
+            sideEnterAngle = 8.0;
+            sideExitAngle = 4.0;
+            centerZoneAngle = 6.0;
+        }
+
+        // Apply center bias calibration when the object is clearly centered
+        if (current_dist_pos > 0.0 && current_dist_pos <= 0.8 && fabs(current_x_pos) <= 40.0 && fabs(angle) <= 8.0) {
+            centerBiasX = (centerBiasX * centerBiasCount + current_x_pos) / (centerBiasCount + 1);
+            if (centerBiasCount < 50) {
+                centerBiasCount++;
+            }
+        }
+
+        // Ignore extreme posX (noise/out of detection range)
+        float validateX = current_x_pos - centerBiasX;
+        if (fabs(validateX) > 600.0) {
+            validateX = (validateX > 0) ? 600.0 : -600.0;
+        }
+
+        // Use only angle for side detection to avoid posX noise
+        bool isCenterZone = (fabs(angle) <= centerZoneAngle);
+        bool forceLeft = (angle < -sideEnterAngle);
+        bool forceRight = (angle > sideEnterAngle);
+        bool keepLeft = (angle < -sideExitAngle);
+        bool keepRight = (angle > sideExitAngle);
+
+        // State machine TIDAK terpengaruh center zone (side detection pure)
+        int8_t newSideState = lastSideState;
+        if (forceLeft) {
+            newSideState = -1;
+        } else if (forceRight) {
+            newSideState = 1;
+        } else if (lastSideState == -1 && keepLeft) {
+            newSideState = -1;
+        } else if (lastSideState == 1 && keepRight) {
+            newSideState = 1;
+        } else {
+            newSideState = 0;
+        }
+
+        // Stronger debounce untuk jarak <= 1.0m (sangat dekat, noise tinggi)
+        uint16_t debounceThreshold;
+        if (current_dist_pos <= 1.0) {
+            debounceThreshold = (newSideState == 0) ? 4 : 6;  // 200-300ms untuk stabil
+        } else if (current_dist_pos <= 1.5) {
+            debounceThreshold = (newSideState == 0) ? 3 : 5;  // 150-250ms
+        } else {
+            debounceThreshold = (newSideState == 0) ? 2 : SIDE_DEBOUNCE_THRESHOLD;  // 100-200ms
+        }
+        
+        if (newSideState != lastSideState) {
+            sideDebounceCounter++;
+            if (sideDebounceCounter >= debounceThreshold) {
+                lastSideState = newSideState;
+                sideDebounceCounter = 0;
+            }
+        } else {
+            sideDebounceCounter = 0;
+        }
+
+        // Send hazard level: jika dist > 2m, force CENTER only (no LEFT/RIGHT classification)
+        if (fabs(angle) <= mainFOV && current_dist_pos > 0.0) {
+            if (current_dist_pos > 2.0) {
+                // ===== JARAK > 2M: CENTER ONLY (tidak ada left/right) =====
+                // Kirim center hazard (atau 0 jika lebih suka aman di jarak jauh)
+                hL = level;  // CENTER → kedua sisi dapat level yang sama
+                hR = level;
+            } else {
+                // ===== JARAK ≤ 2M: FULL LEFT/RIGHT DETECTION =====
+                if (isCenterZone) {
+                    // Center: kirim level ke kedua sisi (KIRI dan KANAN)
+                    hL = level;
+                    hR = level;
+                } else if (lastSideState == -1) {
+                    // Sisi kiri: kirim level ke KIRI saja
+                    hL = level;
+                    hR = 0;
+                } else if (lastSideState == 1) {
+                    // Sisi kanan: kirim level ke KANAN saja
+                    hL = 0;
+                    hR = level;
+                } else {
+                    // Diluar FOV atau tidak ada deteksi
+                    hL = 0;
+                    hR = 0;
+                }
+            }
+        }
+
+        myData.distance = current_dist_pos;
+        myData.speed = (float)current_speed;
+        myData.posX = current_x_pos;
+        myData.hazardLevelL = hL;
+        myData.hazardLevelR = hR;
+
+        esp_now_send(receiverMacAddress, (uint8_t *) &myData, sizeof(myData));
+    }
+
+    // --- DASHBOARD MONITORING (FORMAT ASLI ANDA) ---
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint > 1000) {
+        lastPrint = millis();
+        if (current_dist_pos == 0.0) {
+            Serial.printf("\n⚠️  OBJEK HILANG - Tidak ada deteksi radar\n");
+        } else {
+            Serial.printf("\n📍 LD2450 Jarak: %.2fm | Posisi X: %.0f mm | Angle: %.1f°\n", current_dist_pos, current_x_pos, filteredAngle);
+            Serial.printf("⚡ LD2451 Jarak: %.2fm | Speed: %d\n", current_dist_spd, current_speed);
+            Serial.printf("🚨 KIRI: %d | KANAN: %d (0=Aman, 1=Waspada, 2=Bahaya)\n", myData.hazardLevelL, myData.hazardLevelR);
+        }
+    }
+}

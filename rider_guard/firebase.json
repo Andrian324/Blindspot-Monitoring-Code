@@ -1,0 +1,54 @@
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "rider-guard-fef71",
+          "appId": "1:369774268229:android:4b9e65b779c702bf05782c",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "ios": {
+        "default": {
+          "projectId": "rider-guard-fef71",
+          "appId": "1:369774268229:ios:46021991ac5f609205782c",
+          "uploadDebugSymbols": false,
+          "fileOutput": "ios/Runner/GoogleService-Info.plist"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "rider-guard-fef71",
+          "configurations": {
+            "macos": "1:369774268229:ios:46021991ac5f609205782c"
+          }
+        }
+      },
+      "macos": {
+        "default": {
+          "projectId": "rider-guard-fef71",
+          "appId": "1:369774268229:ios:46021991ac5f609205782c",
+          "uploadDebugSymbols": false,
+          "fileOutput": "macos/Runner/GoogleService-Info.plist"
+        }
+      }
+    }
+  },
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default",
+      "disallowLegacyRuntimeConfig": true,
+      "ignore": [
+        "node_modules",
+        ".git",
+        "firebase-debug.log",
+        "firebase-debug.*.log",
+        "*.local"
+      ],
+      "predeploy": [
+        "npm --prefix \"$RESOURCE_DIR\" run lint"
+      ]
+    }
+  ]
+}

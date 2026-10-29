@@ -1,0 +1,199 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+
+// ===== MASUKKAN MAC ADDRESS ESP32 NOTIFIKASI DI SINI =====
+uint8_t receiverMacAddress[] = {0x88, 0x57, 0x21, 0x8E, 0x45, 0xBC}; // <--- UBAH INI!
+
+HardwareSerial radarPos(2);    // LD2450 (Posisi)
+HardwareSerial radarSpd(1);    // LD2451 (Kecepatan)
+
+typedef struct struct_message {
+  float distance;
+  float posX;           
+  float speed;
+  uint8_t hazardLevelL; 
+  uint8_t hazardLevelR; 
+} struct_message;
+
+struct_message myData;
+esp_now_peer_info_t peerInfo;
+
+// ===== VARIABEL KALMAN & SENSOR =====
+float x_est = 4000.0; 
+float P = 1.0; 
+float Q = 300.0;  // Lincah merespons objek baru
+float R = 400.0;  // Peredam diaktifkan agar stabil
+float current_dist_pos = 0, current_x_pos = 0, current_dist_spd = 0;    
+int16_t current_speed = 0;     
+
+// --- TIMEOUT PISAHAN UNTUK KEDUA RADAR ---
+unsigned long lastPosData = 0; 
+unsigned long lastSpeedData = 0; 
+
+// Filter sudut (Kacamata Kuda 50 Derajat)
+bool insideFOV(float x, float y) {
+    return abs(x) <= (y * 0.45);
+}
+
+void formatTimestamp(char *buffer, size_t len, unsigned long ms) {
+    unsigned long totalSeconds = ms / 1000;
+    unsigned int hours = (totalSeconds / 3600) % 24;
+    unsigned int minutes = (totalSeconds / 60) % 60;
+    unsigned int seconds = totalSeconds % 60;
+    unsigned int millisec = ms % 1000;
+    snprintf(buffer, len, "%02u:%02u:%02u.%03u", hours, minutes, seconds, millisec);
+}
+
+void setup() {
+  Serial.begin(115200);
+  radarPos.begin(256000, SERIAL_8N1, 16, 17);
+  radarSpd.begin(256000, SERIAL_8N1, 14, 27);
+
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+
+  if (esp_now_init() != ESP_OK) return;
+
+  memcpy(peerInfo.peer_addr, receiverMacAddress, 6);
+  peerInfo.channel = 1;  
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+
+  Serial.println("\n=== DUAL RADAR FUSION (STABILISASI & LOGIKA JARAK DEKAT) ===");
+}
+
+// ===== FUNGSI BACA LD2451 =====
+void processLD2451() {
+    static uint8_t state = 0;
+    static uint8_t buffer[20];
+    static uint8_t idx = 0;
+
+    while (radarSpd.available()) {
+        uint8_t byteIn = radarSpd.read();
+        if (state == 0 && byteIn == 0xF4) { state = 1; }
+        else if (state == 1 && byteIn == 0xF3) { state = 2; }
+        else if (state == 2 && byteIn == 0xF2) { state = 3; }
+        else if (state == 3 && byteIn == 0xF1) { state = 4; idx = 0; }
+        else if (state == 4) {
+            buffer[idx++] = byteIn; 
+            
+            if (idx >= 4 && buffer[idx-4] == 0xF8 && buffer[idx-3] == 0xF7 && buffer[idx-2] == 0xF6 && buffer[idx-1] == 0xF5) {
+                if (idx > 6) {
+                    int16_t y2 = buffer[2] | (buffer[3] << 8);
+                    int16_t s2 = buffer[4] | (buffer[5] << 8);
+                    current_dist_spd = (float)y2 / 1000.0; 
+                    current_speed = s2;
+                } else {
+                    current_dist_spd = 0.0; 
+                    current_speed = 0;
+                }
+                
+                lastSpeedData = millis(); 
+                state = 0; 
+            }
+            if (idx >= 20) state = 0; 
+        } else { state = 0; }
+    }
+}
+
+// ===== FUNGSI BACA LD2450 =====
+void processLD2450() {
+    if (radarPos.available() >= 10) {
+        if (radarPos.read() == 0xAA) {
+            if (radarPos.read() == 0xFF) {
+                radarPos.read(); radarPos.read(); 
+                
+                int16_t raw_x = radarPos.read() | (radarPos.read() << 8);
+                int16_t raw_y = radarPos.read() | (radarPos.read() << 8);
+                
+                float x_m = (raw_x & 0x8000) ? -(raw_x & 0x7FFF) : (raw_x & 0x7FFF);
+                float y_m = abs((raw_y & 0x8000) ? -(raw_y & 0x7FFF) : (raw_y & 0x7FFF));
+                current_x_pos = x_m; 
+
+                // PERBAIKAN: Menghilangkan reset instan (0) agar timeout 600ms bisa bekerja menghaluskan data
+                if (y_m > 0 && insideFOV(x_m, y_m)) {
+                    P = P + Q; 
+                    float K = P / (P + R);
+                    x_est = x_est + K * (y_m - x_est); 
+                    P = (1 - K) * P;
+                    current_dist_pos = x_est / 1000.0;
+                    
+                    lastPosData = millis(); // Refresh waktu deteksi posisi
+                }
+            }
+        }
+    }
+}
+
+void loop() {
+    processLD2451();
+    processLD2450();
+
+    // --- TIMEOUT EKSTREM (Satu-satunya jalur untuk mereset data) ---
+    if (millis() - lastPosData > 600) {
+        current_dist_pos = 0.0;
+        current_x_pos = 0;
+        x_est = 4000.0; P = 1.0;
+    }
+    if (millis() - lastSpeedData > 600) {
+        current_dist_spd = 0.0;
+        current_speed = 0;
+    }
+
+    static unsigned long lastSend = 0;
+    if (millis() - lastSend > 100) { 
+        lastSend = millis();
+        
+        uint8_t hazardLevel = 0; 
+        static unsigned long overrideHoldTimer = 0;
+
+        // --- LOGIKA KLASIFIKASI BEBAS NYANGKUT ---
+        
+        // 1. KILL-SWITCH MENYALIP YANG SUDAH DIPINTARKAN
+        // Hanya matikan alarm jika kendaraan menjauh DAN posisinya sudah > 1.5 meter.
+        // Jika posisinya masih sangat dekat (< 1.5m), logika ini akan dilewati.
+        if (current_speed < -300 && current_dist_pos > 1.5) {
+            hazardLevel = 0; 
+            overrideHoldTimer = 0; 
+        }
+        // 2. FUSI OVERRIDE SEJATI (Terdeteksi ancaman kecepatan tinggi > 0.8 m/s)
+        else if (current_dist_pos >= 1.5 && current_dist_pos <= 4.0 && current_speed >= 800) {
+            hazardLevel = 2;  
+            overrideHoldTimer = millis(); 
+        } 
+        // 3. LOGIKA HOLD TIMER (Tahan alarm Bahaya)
+        else if (millis() - overrideHoldTimer < 1500) {
+            hazardLevel = 2; 
+        }
+        // 4. LOGIKA STANDAR JARAK (Objek pelan / mengikuti / area dekat)
+        else {
+            if (current_dist_pos >= 0.1 && current_dist_pos < 1.5) {
+                hazardLevel = 2; 
+            } else if (current_dist_pos >= 1.5 && current_dist_pos <= 4.0) {
+                hazardLevel = 1; 
+            }
+        }
+
+        // Susun Paket
+        myData.distance = current_dist_pos;
+        myData.posX = current_x_pos;                   
+        myData.speed = (float)current_speed / 1000.0;  
+        myData.hazardLevelL = hazardLevel;
+        myData.hazardLevelR = hazardLevel;
+
+        esp_now_send(receiverMacAddress, (uint8_t *) &myData, sizeof(myData));
+    }
+
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint > 1000) {  
+        lastPrint = millis();
+        char timestamp[16];
+        formatTimestamp(timestamp, sizeof(timestamp), lastPrint);
+        long dist_mm = (long)(current_dist_pos * 1000.0 + 0.5);
+        long dist_spd_mm = (long)(current_dist_spd * 1000.0 + 0.5);
+        Serial.printf("\n[%s] 📍 LD2450 Jarak: %.3fm (%ld mm) | Posisi X: %.0f mm\n", timestamp, current_dist_pos, dist_mm, current_x_pos);
+        Serial.printf("[%s] ⚡ LD2451 Jarak: %.3fm (%ld mm) | Speed: %d (%.2f m/s)\n", timestamp, current_dist_spd, dist_spd_mm, current_speed, (float)current_speed / 1000.0);
+        Serial.printf("[%s] 🚨 STATUS SISTEM: %d  (0=Aman, 1=Waspada, 2=Bahaya)\n", timestamp, myData.hazardLevelL);
+    }
+}
